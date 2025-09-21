@@ -1,0 +1,8 @@
+flask
+flask-cors
+sqlalchemy
+psycopg2-binary
+argon2-cffi
+pandas
+apscheduler
+pynacl

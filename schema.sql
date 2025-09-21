@@ -1,0 +1,1 @@
+-- schema.sql placeholder; full version in conversation history
