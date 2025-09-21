@@ -1,7 +1,3 @@
-Got it — here’s a clean, properly formatted README.md with headings, tables that render well, fenced code blocks, and a Mermaid ER diagram.
-
-⸻
-
 pg-sched — scheduled Postgres query runner + JSONB results API
 
 pg-sched is a compact platform to schedule SQL queries, store every run’s results, and serve them via a JSON API for dashboards. It includes:
