@@ -1,65 +1,53 @@
 # pg-sched — scheduled Postgres query runner + JSONB results API
 
-pg-sched is a compact platform to **schedule SQL queries**, **store every run’s results**, and **serve them via a JSON API** for dashboards. It includes:
+pg-sched is a compact platform to **schedule SQL queries**, **store every run’s results**, and **serve them via a JSON API** for dashboards.
 
-- **Flask API** (read endpoints + admin CRUD via blueprints)  
-- **Worker** (APScheduler; cron/interval per query)  
-- **Click CLI** (keys, users, data sources, queries)  
-- **RFC5424-style local logging** with rotation, gzip, retention
-
----
-
-## Features
-
-- Store queries with title, description, SQL, schedule (cron/interval), timezone, and enabled flag.
-- Execute against external Postgres sources; **passwords are encrypted** via **libsodium sealed boxes**.
-- Persist each run with timing, status, row count, and **results in JSONB** (Pandas `orient='table'`).
-- API to fetch latest run, page through run history, filter by time, or dry-run a query safely.
-- Local RFC-style logs with daily rotation, gzip after N days, retention.
+- Flask API (users/auth, data sources, queries CRUD, run browsing)
+- Worker (APScheduler; cron/interval per query)
+- Click CLI (keys, users, data sources, queries)
+- RFC5424-style local logging with rotation, gzip, retention
+- Passwords for external Postgres sources encrypted via **NaCl sealed boxes**
 
 ---
 
-## Architecture
+## Architecture (high level)
 
-```
-               +-------------------+
-               |   Postgres (App)  |  <-- users, roles, data_sources,
-               |  "metadata DB"    |      query_job, query_run, query_run_blob
-               +---------+---------+
-                         ^
-                         | SQLAlchemy Engine (cfg().engine)
-+------------------------+-------------------------+
-|                       App                        |
-|                                                  |
-|  Flask API (api.py)                              |
-|  - Session cookie (sid), CORS, ProxyFix          |
-|  - Blueprints:                                   |
-|     /api (users & auth)                          |
-|     /api/datasources (admin)                     |
-|     /api/admin/queries (CRUD + dry-run)          |
-|     /api/queries/<qid>/runs... (public read)     |
-|  - RFC5424-like file logging (local logs/)       |
-+------------------------+-------------------------+
-                         |
-                         v
-+--------------------------------------------------+
-|   Worker (worker.py)                             |
-|   - Reads enabled query_job rows                 |
-|   - APScheduler: cron/interval per query         |
-|   - Decrypts DSN via libsodium private key       |
-|   - Runs SELECT, saves results to JSONB          |
-|   - RFC5424-like file logging                    |
-+--------------------------------------------------+
-                         |
-                         v
-               +-------------------+
-               | Postgres Sources  |  <-- external read-only DBs
-               +-------------------+
+```mermaid
+flowchart TD
+  subgraph API["Flask API"]
+    U[Users & Sessions]\n(bp_users.py)
+    DS[Data Sources]\n(bp_conn.py)
+    QCRUD[Queries CRUD]\n(bp_queries.py)
+    RR[Runs & Results]\n(api.py)
+  end
+
+  subgraph Worker["Worker"]
+    SCHED[APScheduler]
+    EXEC[Query Executor]
+  end
+
+  subgraph AppDB["Postgres (App metadata)"]
+    T1[(user_*)]
+    T2[(data_source)]
+    T3[(query_job)]
+    T4[(query_run, query_run_blob)]
+  end
+
+  subgraph Src["External Postgres Sources"]
+    PG1[(analytics)]
+    PG2[(warehouse)]
+  end
+
+  API -->|SQLAlchemy| AppDB
+  Worker -->|SQLAlchemy| AppDB
+  EXEC -->|SELECT| Src
+  QCRUD --> RR
+  SCHED --> EXEC
 ```
 
 ---
 
-## ER diagram (Mermaid)
+## ER diagram
 
 ```mermaid
 erDiagram
@@ -149,145 +137,159 @@ erDiagram
 
 ---
 
-## Security model
+## Flows
 
-- External DSN passwords stored as **libsodium sealed-box ciphertext** in `data_source.enc_password`.
-  - Encrypt with **public** key (`PUBLIC_KEY_B64_PATH`)
-  - Decrypt with **private** key (`APP_PRIVATE_KEY_B64_PATH`) in API/worker
-- Users & roles (`viewer`, `editor`, `admin`) with session auth (cookie `sid`).
-- Password hashing: **Argon2id** + app-wide **pepper** (`ARGON2_SECRET_KEY_B64`) + per-hash random salt.
-- Logs redact keys in `REDACT_KEYS`; payloads truncated to `MAX_LOG_BYTES`.
-- **SELECT-only** enforced for queries (API & worker).
+### 1) Login → Session → AuthZ
 
-### Why NaCl Sealed Boxes
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant A as API (Flask)
+  participant DB as App DB
 
-- **Asymmetric**: encrypt anywhere with public key; only server (private key) can decrypt.  
-- **Misuse-resistant**: safe defaults (Curve25519 + XSalsa20-Poly1305), ephemeral keys, authenticated.  
-- **Operationally simple**: DB dumps are safe; key rotation supported by CLI; plaintext never logged.
+  C->>A: POST /api/auth/login {email,password}
+  A->>DB: SELECT user by email
+  DB-->>A: user row + password_hash
+  A-->>C: Set-Cookie: sid; {ok,user,roles}
+
+  Note over C,A: Subsequent calls reuse sid cookie
+
+  C->>A: GET /api/users/me
+  A->>DB: validate session by sid
+  DB-->>A: session + user + roles
+  A-->>C: {authenticated:true,user,roles}
+
+  C->>A: GET /api/admin/queries
+  A->>DB: check role editor/admin
+  DB-->>A: ok
+  A-->>C: items...
+```
+
+### 2) Admin creates Data Source and Query → Worker executes → Dashboard reads latest
+
+```mermaid
+flowchart TD
+  A1[POST /api/datasources<br/>encrypt with public key] --> D1[(data_source.enc_password)]
+  A2[POST /api/admin/queries] --> D2[(query_job)]
+  subgraph Worker
+    W0[load enabled query_job] --> W1[resolve data_source]
+    W1 -->|decrypt with private key| W2[build DSN]
+    W2 --> W3[run SELECT on source DB]
+    W3 --> W4[(query_run)]
+    W4 --> W5[(query_run_blob JSONB)]
+  end
+  A2 --> W0
+  D1 --> W1
+  D2 --> W0
+  subgraph Read
+    R1[GET /api/queries/:id/runs/latest] --> R2[(query_run + blob)]
+  end
+  W5 --> R2
+```
+
+### 3) Dry-run (no persistence)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant E as Editor/Admin
+  participant A as API
+  participant DB as App DB
+  participant S as Source PG
+
+  E->>A: POST /api/admin/queries/:id/test {limit,timeout_ms}
+  A->>DB: load query_job + data_source
+  A->>DB: read enc_password
+  A->>A: decrypt with private key
+  A->>S: open connection (optional statement_timeout)
+  A->>S: SELECT wrapped with LIMIT
+  S-->>A: rows
+  A-->>E: {ok:true,columns,row_count,rows,timing_ms}
+```
+
+### 4) APScheduler scheduling and execution
+
+```mermaid
+flowchart TD
+  S0[start scheduler] --> S1[list enabled queries]
+  S1 --> S2{schedule_type}
+  S2 -- cron --> S3[CronTrigger]
+  S2 -- interval --> S4[IntervalTrigger]
+  S3 --> S5[add_job execute_job]
+  S4 --> S5
+  S5 --> S6[on trigger: execute_job]
+  S6 --> S7[record run start]
+  S7 --> S8[decrypt DSN]
+  S8 --> S9[exec SELECT]
+  S9 --> S10[save JSONB result]
+  S10 --> S11[record success]
+  S9 -- error --> S12[record error]
+```
+
+### 5) Key rotation via CLI
+
+```mermaid
+flowchart TD
+  K0[cli keys rotate] --> K1[pg_dump metadata DB]
+  K1 --> K2[load new public/private key]
+  K2 --> K3[for each data_source]
+  K3 --> K4[decrypt current enc_password]
+  K4 --> K5[encrypt with new public key]
+  K5 --> K6[update enc_password,key_version]
+  K6 --> K7[test connections]
+  K7 --> K8[done]
+```
+
+### 6) RFC-style logging with rotation/gzip/retention
+
+```mermaid
+flowchart TD
+  L0[emit log record] --> L1[RFC5424 formatter]
+  L1 --> L2[file handler: pgsched-*.log]
+  L2 --> L3[daily rotation]
+  L3 --> L4{age > GZIP_AFTER_DAYS?}
+  L4 -- yes --> L5[gzip old files]
+  L5 --> L6{age > KEEP_DAYS?}
+  L4 -- no --> L6
+  L6 -- yes --> L7[delete]
+  L6 -- no --> L8[keep]
+```
+
+### 7) Run history navigation
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as Client
+  participant A as API
+  participant DB as App DB
+
+  U->>A: GET /api/queries/:id/runs/latest
+  A->>DB: select last run + blob
+  DB-->>A: run + JSONB
+  A-->>U: result
+
+  U->>A: GET /api/queries/:id/runs/:rid/prev
+  A->>DB: select id < rid order by id desc limit 1
+  DB-->>A: prev_run_id
+  A-->>U: {id,_link}
+
+  U->>A: GET /api/runs/:run_id
+  A->>DB: select run + blob
+  DB-->>A: run + JSONB
+  A-->>U: result
+```
 
 ---
 
-## Configuration
+## Notes for GitHub Mermaid
 
-All settings come from environment variables (you can use `.env`).  
+- Use triple backticks with the word `mermaid` right after, like:
+  \`\`\`mermaid
+  ...diagram...
+  \`\`\`
+- Stick to simple types/keywords (e.g., `int`, `string`, `boolean`, `datetime`, `json`) in ERD.
+- Avoid quotes or extra comments inside ER blocks.
+- For flowcharts, use `flowchart TD` or `flowchart LR`. For sequences, use `sequenceDiagram`.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `PG_DSN_APP` | — | Metadata DB DSN (SQLAlchemy) |
-| `PUBLIC_KEY_B64_PATH` | `./public_key.base64` | Path to libsodium public key (encrypt) |
-| `APP_PRIVATE_KEY_B64_PATH` | — | Path to libsodium private key (decrypt) |
-| `ARGON2_SECRET_KEY_B64` | — | Base64 32–64 bytes; Argon2 pepper |
-| `SESSION_TTL_HOURS` | `72` | Session lifetime |
-| `SESSION_EXTEND_ON_USE_MIN` | `60` | Auto-extend window (minutes) |
-| `ALLOWED_ROLES` | `viewer,editor,admin` | Allowed roles |
-| `DEFAULT_QUERY_INTERVAL` | `21600` | Fallback interval (seconds) |
-| `APP_NAME` | `pgsched-api` | Log app name |
-| `LOG_DIR` | `./logs` | Directory for logs |
-| `RFC_ENTERPRISE_ID` | `32473` | RFC5424 SD-ID enterprise ID |
-| `ROTATE_UTC` | `1` | Rotate at UTC midnight |
-| `GZIP_AFTER_DAYS` | `7` | Gzip rotated logs after N days |
-| `KEEP_DAYS` | `200` | Retain logs (days) |
-| `MAX_LOG_BYTES` | `4096` | Max bytes of payload in logs |
-| `REDACT_KEYS` | `password,new_password,current_password,token,authorization,secret` | Keys to mask in logs |
-| `TRUST_PROXY` | `1` | Enable **ProxyFix** to trust `X-Forwarded-*` headers |
-| `CORS_ALLOWED_ORIGINS` | `*` | Comma-separated allowed origins |
-
-**`TRUST_PROXY` note:** Enable (`1`) only when running behind a **trusted reverse proxy** (NGINX/HAProxy/ALB) that sets/strips `X-Forwarded-*`. If the app is public-facing directly, set to `0` to avoid header spoofing.
-
----
-
-## API overview
-
-### Users & Auth (`/api`)
-- `POST /auth/login` → `{email, password}` → sets `sid` cookie  
-- `POST /auth/logout`  
-- `GET /users/me`  
-- `GET /users` (admin)  
-- `POST /users` (admin) → `{email, name, password, roles[]}`  
-- `GET /users/<uid>` (admin)  
-- `PATCH /users/<uid>` (self/admin; roles admin-only)  
-- `DELETE /users/<uid>` (admin)  
-- `POST /users/<uid>/password` (self/admin) → `{new_password, current_password?}`
-
-### Data Sources (`/api/datasources`, admin)
-- `GET /` list  
-- `POST /` → `{name, host, port?, dbname, username, password? | enc_password_b64?, key_version?}`  
-- `GET /<dsid>`  
-- `PATCH /<dsid>` (same fields; supports password rotate)  
-- `DELETE /<dsid>?force=1`  
-- `POST /<dsid>/test` (decrypt + `SELECT 1`)
-
-### Queries CRUD (`/api/admin/queries`, editor/admin)
-- `GET /` list (`q`, `enabled`, `limit`, `offset`)  
-- `POST /` → `{name, title, description?, sql_text, data_source_id|data_source, schedule_type, schedule_expr, timezone?, enabled?}`  
-- `GET /<qid>`  
-- `PATCH /<qid>` (same fields; SELECT-only)  
-- `DELETE /<qid>?force=1`  
-- `POST /<qid>/test` dry-run (no persistence) → `{limit?, timeout_ms?}`
-
-### Runs & Results (`/api`)
-- `GET /queries/<qid>/runs` (pagination + `start`, `end`, `before`, `after`, `limit`)  
-- `GET /queries/<qid>/runs/latest`  
-- `GET /runs/<run_id>`  
-- `GET /queries/<qid>/runs/<run_id>/prev`  
-- `GET /queries/<qid>/runs/<run_id>/next`
-
----
-
-## Quickstart
-
-```bash
-python -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env    # edit with your settings
-psql "$PG_DSN_APP" -f schema.sql
-```
-
-**Keys:**
-```bash
-python cli.py keys gen --public ./public_key.base64 --private ./private_key.base64
-```
-
-**Admin user:**
-```bash
-python cli.py users add --email admin@example.com --name "Admin" --roles admin --password 'StrongPW!'
-```
-
-**Add data source:**
-```bash
-python cli.py dsn add --name analytics_ro --host db.example.com --port 5432   --dbname analytics --username readonly --password 's3cret' --key-version 1
-```
-
-**Add query (6-hour interval):**
-```bash
-python cli.py queries add   --name orders_last_24h   --title "Orders (24h)"   --sql "SELECT created_at AS ts, id, amount FROM orders WHERE created_at > now() - interval '24 hours';"   --data-source analytics_ro   --schedule-type interval --schedule-expr PT6H   --timezone UTC --enabled
-```
-
-**Run services:**
-```bash
-python api.py      # Flask API
-python worker.py   # Scheduler/runner
-```
-
----
-
-## Tips
-
-- Use `POST /api/admin/queries/<qid>/test` to validate SQL and latency **without** persisting results.  
-- Typical result sets (<~150 rows) are perfect for JSONB storage.  
-- For dashboards:  
-  - `GET /api/queries/<qid>/runs/latest` for newest, or  
-  - `GET /api/queries/<qid>/runs?start=...&end=...` to browse history.
-
----
-
-## Roadmap
-
-- OpenAPI/Swagger spec
-
-
-- Row-level permissions  
-- CSV/Parquet export next to JSONB  
-- Result size guardrails & sampling
