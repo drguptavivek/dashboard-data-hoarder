@@ -63,89 +63,88 @@ pg-sched is a compact platform to **schedule SQL queries**, **store every run’
 
 ```mermaid
 erDiagram
-    data_source {
-        int        id PK
-        text       name UNIQUE
-        text       host
-        int        port
-        text       dbname
-        text       username
-        bytea      enc_password
-        text       enc_algo
-        int        key_version
-        timestamptz created_at
-        timestamptz updated_at
-    }
+  data_source {
+    int id PK
+    string name
+    string host
+    int port
+    string dbname
+    string username
+    bytes enc_password
+    string enc_algo
+    int key_version
+    datetime created_at
+    datetime updated_at
+  }
 
-    query_job {
-        int        id PK
-        text       name UNIQUE
-        text       title
-        text       description
-        text       sql_text
-        int        data_source_id FK
-        text       schedule_type  "cron|interval"
-        text       schedule_expr
-        text       timezone
-        bool       enabled
-        timestamptz created_at
-        timestamptz updated_at
-    }
+  query_job {
+    int id PK
+    string name
+    string title
+    string description
+    string sql_text
+    int data_source_id FK
+    string schedule_type
+    string schedule_expr
+    string timezone
+    boolean enabled
+    datetime created_at
+    datetime updated_at
+  }
 
-    query_run {
-        int        id PK
-        int        query_id FK
-        timestamptz scheduled_at
-        text       job_timezone
-        timestamptz run_started_at
-        timestamptz run_finished_at
-        int        duration_ms
-        text       status        "running|success|error"
-        int        rows_returned
-        text       error_message
-    }
+  query_run {
+    int id PK
+    int query_id FK
+    datetime scheduled_at
+    string job_timezone
+    datetime run_started_at
+    datetime run_finished_at
+    int duration_ms
+    string status
+    int rows_returned
+    string error_message
+  }
 
-    query_run_blob {
-        int        run_id PK,FK
-        text       format        "jsonb"
-        jsonb      df_json
-        int        row_count
-        int        byte_size
-    }
+  query_run_blob {
+    int run_id PK, FK
+    string format
+    json df_json
+    int row_count
+    int byte_size
+  }
 
-    user_account {
-        int        id PK
-        text       email UNIQUE
-        text       name
-        text       password_hash
-        bool       is_active
-        timestamptz created_at
-        timestamptz updated_at
-    }
+  user_account {
+    int id PK
+    string email
+    string name
+    string password_hash
+    boolean is_active
+    datetime created_at
+    datetime updated_at
+  }
 
-    user_role {
-        int        user_id FK
-        text       role
-        PK         (user_id, role)
-    }
+  user_role {
+    int user_id PK, FK
+    string role PK
+  }
 
-    user_session {
-        text       id PK         "sid"
-        int        user_id FK
-        timestamptz created_at
-        timestamptz last_seen_at
-        timestamptz expires_at
-        text       ip
-        text       user_agent
-        bool       is_revoked
-    }
+  user_session {
+    string id PK
+    int user_id FK
+    datetime created_at
+    datetime last_seen_at
+    datetime expires_at
+    string ip
+    string user_agent
+    boolean is_revoked
+  }
 
-    %% Relationships
-    data_source ||--o{ query_job : "provides DSN for"
-    query_job ||--o{ query_run : "has many runs"
-    query_run ||--|| query_run_blob : "has 1 result blob"
-    user_account ||--o{ user_role : "has roles"
-    user_account ||--o{ user_session : "has sessions"
+  %% Relationships
+  data_source ||--o{ query_job : provides
+  query_job ||--o{ query_run : has
+  query_run ||--|| query_run_blob : has
+  user_account ||--o{ user_role : has
+  user_account ||--o{ user_session : has
 ```
 
 ---
